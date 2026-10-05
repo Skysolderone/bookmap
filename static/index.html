@@ -1,0 +1,525 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Footprint 足迹图</title>
+<style>
+  :root {
+    --bg: #0f1216; --panel: #171b21; --line: #262c35; --text: #c9d1d9; --dim: #7d8590;
+    --buy: #22c55e; --sell: #ef4444; --poc: #facc15; --accent: #60a5fa;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 12px -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", sans-serif; overflow: hidden; }
+  #bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; padding: 6px 12px;
+    background: var(--panel); border-bottom: 1px solid var(--line); }
+  #bar label { color: var(--dim); display: inline-flex; align-items: center; gap: 5px; }
+  select, input[type=number] { background: #0d1117; color: var(--text); border: 1px solid var(--line);
+    border-radius: 4px; padding: 2px 4px; font: inherit; }
+  input[type=number] { width: 58px; }
+  button { background: #21262d; color: var(--text); border: 1px solid var(--line); border-radius: 4px;
+    padding: 2px 8px; font: inherit; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  #legend { display: inline-flex; align-items: center; gap: 10px; color: var(--dim); }
+  .sw { display: inline-block; width: 12px; height: 12px; border-radius: 2px; vertical-align: -2px; margin-right: 3px; }
+  #status { margin-left: auto; color: var(--dim); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  #status .ok { color: var(--buy); } #status .warn { color: var(--poc); } #status .bad { color: var(--sell); }
+  #wrap { position: absolute; top: 0; left: 0; right: 0; bottom: 0; }
+  #cv { display: block; width: 100%; height: 100%; cursor: crosshair; }
+  #cv.drag { cursor: grabbing; }
+  #tip { position: fixed; pointer-events: none; background: rgba(13,17,23,.96); border: 1px solid var(--line);
+    border-radius: 6px; padding: 7px 9px; line-height: 1.55; font-variant-numeric: tabular-nums;
+    white-space: nowrap; z-index: 10; box-shadow: 0 4px 16px rgba(0,0,0,.5); }
+  #tip b { color: #fff; font-weight: 600; }
+  #tip .k { color: var(--dim); display: inline-block; min-width: 64px; }
+  #tip hr { border: 0; border-top: 1px solid var(--line); margin: 5px 0; }
+  .buy { color: var(--buy); } .sell { color: var(--sell); }
+</style>
+</head>
+<body>
+<div id="bar">
+  <label>品种 <select id="sym"></select></label>
+  <label>周期 <select id="iv"></select></label>
+  <label>分桶 <select id="bucket"></select></label>
+  <label title="买方失衡：本档主动买 ≥ 下一档主动卖 × 倍数；卖方失衡：本档主动卖 ≥ 上一档主动买 × 倍数">失衡倍数 <input id="ratio" type="number" min="1" step="0.5" value="3"></label>
+  <label title="参与失衡判断的最小成交量（以基础币计）">最小量 <input id="minv" type="number" min="0" step="any" value="0"></label>
+  <label title="对角档没有成交（为 0）时不判定失衡，避免价位边缘大量误报"><input id="nozero" type="checkbox" checked> 忽略零值</label>
+  <label><input id="follow" type="checkbox" checked> 跟随最新</label>
+  <span id="legend">
+    <span>格子：<b class="sell">主动卖</b> × <b class="buy">主动买</b></span>
+    <span><i class="sw" style="background:rgba(34,197,94,.7)"></i>买多</span>
+    <span><i class="sw" style="background:rgba(239,68,68,.7)"></i>卖多</span>
+    <span title="本档主动买 ≥ 下一档主动卖 × 倍数：格子右侧绿条，买量亮绿加粗"><i class="sw" style="background:#2a3038;box-shadow:inset -3px 0 0 var(--buy)"></i>买方失衡</span>
+    <span title="本档主动卖 ≥ 上一档主动买 × 倍数：格子左侧红条，卖量亮红加粗"><i class="sw" style="background:#2a3038;box-shadow:inset 3px 0 0 var(--sell)"></i>卖方失衡</span>
+    <span><i class="sw" style="border:2px solid var(--poc);"></i>POC</span>
+    <span title="列左侧细条：开盘→收盘（绿涨红跌），细线为最高→最低"><i class="sw" style="width:3px;background:var(--buy)"></i>开→收</span>
+    <span title="滚轮：缩放（Shift 仅横向，Alt 仅纵向）；拖动：平移；双击：回到最新">滚轮缩放 · 拖动平移 · 双击回到最新</span>
+  </span>
+  <span id="status">连接中…</span>
+</div>
+<div id="wrap"><canvas id="cv"></canvas></div>
+<div id="tip" hidden></div>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const cv = $("cv"), ctx = cv.getContext("2d"), tip = $("tip");
+const AXIS_W = 78, SUM_ROW = 15, SUM_H = SUM_ROW * 4 + 6, COL_PAD = 6;
+
+let meta = null, spec = null, sub = null, ws = null;
+let bars = [], barByT = new Map();
+let pendingReset = true;
+const view = { colW: 92, rowH: 16, ro: 0.3, center: 0, follow: true };
+const opt = { ratio: 3, minUnits: 0, ignoreZeros: true };
+let lastStatus = null, mouse = null, needDraw = false;
+
+// ---------- 数值格式 ----------
+let qScale = 1, pScale = 1;
+function qty(u) { return u / qScale; }
+function abbr(v) {
+  const a = Math.abs(v);
+  if (a === 0) return "0";
+  if (a >= 1e9) return (v / 1e9).toFixed(a >= 1e10 ? 0 : 1) + "B";
+  if (a >= 1e6) return (v / 1e6).toFixed(a >= 1e7 ? 0 : 1) + "M";
+  if (a >= 1e3) return (v / 1e3).toFixed(a >= 1e4 ? 0 : 1) + "k";
+  if (a >= 100) return v.toFixed(0);
+  if (a >= 10) return v.toFixed(1);
+  if (a >= 1) return v.toFixed(2).replace(/\.?0+$/, "");
+  return v.toFixed(3).replace(/\.?0+$/, "");
+}
+function abbrU(u) { return abbr(qty(u)); }
+function signed(u) { const s = abbrU(u); return u > 0 ? "+" + s : s; }
+function fullQ(u) { return qty(u).toFixed(spec.qtyDec); }
+function priceOfTicks(t) { return (t * spec.tickUnits / pScale).toFixed(spec.priceDec); }
+function bucketLabel(b) { return priceOfTicks(b); }
+const pad2 = (n) => String(n).padStart(2, "0");
+function hm(t, sec) { const d = new Date(t); return pad2(d.getHours()) + ":" + pad2(d.getMinutes()) + (sec ? ":" + pad2(d.getSeconds()) : ""); }
+function ymdhms(t) { const d = new Date(t); return `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())} ${hm(t, true)}`; }
+const IV_MS = { "30s": 30e3, "1m": 60e3, "5m": 300e3, "15m": 900e3 };
+
+// ---------- 数据 ----------
+function prep(b) {
+  b.map = new Map();
+  for (const c of b.cells) b.map.set(c[0], c);
+  return b;
+}
+// CVD = 服务端给出的起点（已加载第一根之前的累计 delta）+ 逐根累加；实时推送的 K 线不带可靠的 cvd，统一在这里重算
+let cvdBase = 0, hasMore = false, histPending = false;
+function recomputeCvd() {
+  let cvd = cvdBase;
+  for (const b of bars) { cvd += b.delta; b.cvd = cvd; }
+}
+function setBars(list, more) {
+  bars = list.map(prep); barByT = new Map(bars.map((b) => [b.t, b]));
+  cvdBase = bars.length ? bars[0].cvd - bars[0].delta : 0;
+  hasMore = !!more; histPending = false;
+  recomputeCvd();
+}
+function prependBars(list, more) {
+  const older = list.filter((b) => !barByT.has(b.t) && (!bars.length || b.t < bars[0].t)).map(prep);
+  if (older.length) {
+    bars = older.concat(bars);
+    for (const b of older) barByT.set(b.t, b);
+    cvdBase = older[0].cvd - older[0].delta;
+    recomputeCvd();
+  }
+  hasMore = !!more && older.length > 0; histPending = false;
+}
+function maybeLoadHistory() {
+  // 视图左侧接近已加载数据的开头时向服务端要更早的 K 线
+  if (!hasMore || histPending || !bars.length || !sub) return;
+  const leftIdx = Math.floor(bars.length + view.ro - plotW() / view.colW);
+  if (leftIdx < 40) { histPending = true; send({ type: "history", before: bars[0].t, symbol: sub.symbol, interval: sub.interval, bucket: sub.bucket }); }
+}
+function upsert(list) {
+  let resort = false;
+  for (const nb of list) {
+    prep(nb);
+    const old = barByT.get(nb.t);
+    if (old) bars[bars.lastIndexOf(old)] = nb;  // 绝大多数是最后一根，从尾部找
+    else { if (bars.length && nb.t < bars[bars.length - 1].t) resort = true; bars.push(nb); }
+    barByT.set(nb.t, nb);
+  }
+  if (resort) bars.sort((a, b) => a.t - b.t);
+  const keep = Date.now() - meta.retentionMs - IV_MS[sub.interval];
+  while (bars.length && bars[0].t < keep) { const b = bars.shift(); barByT.delete(b.t); cvdBase += b.delta; }
+  recomputeCvd();
+}
+
+// ---------- 本地 WebSocket ----------
+function connect() {
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onmessage = (ev) => {
+    const m = JSON.parse(ev.data);
+    if (m.type === "meta") onMeta(m);
+    else if (m.type === "status") { lastStatus = m; renderStatus(); }
+    else if (m.type === "snapshot") {
+      if (!sameSub(m)) return;
+      setBars(m.bars, m.more);
+      if (pendingReset) { resetView(); pendingReset = false; }
+      draw();
+    } else if (m.type === "history") {
+      if (!sameSub(m)) return;
+      prependBars(m.bars, m.more);
+      draw();
+    } else if (m.type === "bars") {
+      if (!sameSub(m) || !bars) return;
+      upsert(m.bars);
+      if (view.follow) followLatest();
+      draw();
+    }
+  };
+  ws.onclose = () => { $("status").innerHTML = '<span class="bad">本地服务断开，重连中…</span>'; setTimeout(connect, 1500); };
+}
+function sameSub(m) { return sub && m.symbol === sub.symbol && m.interval === sub.interval && m.bucket === sub.bucket; }
+function send(o) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
+
+function store(k, v) { try { localStorage.setItem("fp." + k, v); } catch (e) {} }
+function load(k) { try { return localStorage.getItem("fp." + k); } catch (e) { return null; } }
+
+function onMeta(m) {
+  const first = !meta;
+  meta = m;
+  const symSel = $("sym"), ivSel = $("iv");
+  symSel.innerHTML = m.symbols.map((s) => `<option>${s}</option>`).join("");
+  ivSel.innerHTML = m.intervals.map((s) => `<option>${s}</option>`).join("");
+  const sym = sub ? sub.symbol : (m.symbols.includes(load("sym")) ? load("sym") : m.symbols[0]);
+  const iv = sub ? sub.interval : (m.intervals.includes(load("iv")) ? load("iv") : m.defaultInterval);
+  symSel.value = sym; ivSel.value = iv;
+  selectSymbol(sym, iv, sub ? sub.bucket : null);
+  if (!first) pendingReset = false;
+}
+function selectSymbol(sym, iv, bucket) {
+  spec = meta.specs[sym];
+  qScale = 10 ** spec.qtyDec; pScale = 10 ** spec.priceDec;
+  applyMinv();
+  const choices = spec.bucketChoices.slice();
+  if (!choices.includes(spec.defaultBucket)) { choices.push(spec.defaultBucket); choices.sort((a, b) => a - b); }
+  const saved = parseInt(load("bucket." + sym), 10);
+  const bk = bucket || (choices.includes(saved) ? saved : spec.defaultBucket);
+  $("bucket").innerHTML = choices.map((c) => `<option value="${c}">${bucketLabel(c)}</option>`).join("");
+  $("bucket").value = String(bk);
+  subscribe(sym, iv, bk);
+}
+function subscribe(symbol, interval, bucket) {
+  const changedSym = !sub || sub.symbol !== symbol;
+  const oldBucket = sub ? sub.bucket : null;
+  sub = { symbol, interval, bucket };
+  bars = []; barByT = new Map();
+  if (changedSym) pendingReset = true;
+  else if (oldBucket && oldBucket !== bucket) view.center = view.center * oldBucket / bucket;
+  store("sym", symbol); store("iv", interval); store("bucket." + symbol, bucket);
+  send({ type: "subscribe", symbol, interval, bucket });
+  draw();
+}
+$("sym").onchange = (e) => selectSymbol(e.target.value, $("iv").value, null);
+$("iv").onchange = (e) => subscribe(sub.symbol, e.target.value, sub.bucket);
+$("bucket").onchange = (e) => subscribe(sub.symbol, sub.interval, parseInt(e.target.value, 10));
+$("ratio").oninput = (e) => { opt.ratio = Math.max(1, parseFloat(e.target.value) || 3); store("ratio", opt.ratio); draw(); };
+$("minv").oninput = (e) => { store("minv", e.target.value); applyMinv(); draw(); };
+function applyMinv() { opt.minUnits = Math.max(0, parseFloat($("minv").value) || 0) * qScale; }
+$("follow").onchange = (e) => { view.follow = e.target.checked; if (view.follow) followLatest(true); draw(); };
+if (load("ratio")) { $("ratio").value = load("ratio"); opt.ratio = parseFloat(load("ratio")) || 3; }
+if (load("minv")) $("minv").value = load("minv");
+$("nozero").onchange = (e) => { opt.ignoreZeros = e.target.checked; store("nozero", e.target.checked ? "1" : "0"); draw(); };
+if (load("nozero") === "0") { $("nozero").checked = false; opt.ignoreZeros = false; }
+
+function renderStatus() {
+  const s = lastStatus; if (!s || !sub) return;
+  const f = s.feeds[sub.symbol]; if (!f) return;
+  const wsCls = s.ws === "live" ? "ok" : "bad";
+  let st = f.state === "history" ? `<span class="warn">加载历史日包 ${f.progress}</span>`
+         : f.state === "backfill" ? `<span class="warn">回补中 ${f.progress}</span>`
+         : f.state === "gapfill" ? '<span class="warn">补缺中</span>'
+         : f.state === "init" ? '<span class="warn">准备中</span>' : '<span class="ok">实时</span>';
+  const lag = f.lagMs == null ? "-" : (f.lagMs / 1000).toFixed(1) + "s";
+  $("status").innerHTML = `币安 <span class="${wsCls}">${s.ws}</span> · ${st} · 最新成交 ${lag} 前 · ` +
+    `成交 ${f.trades.toLocaleString()} 笔 · 补缺 ${f.gapFills} 次${f.lost ? ` · <span class="bad">丢失 ${f.lost}</span>` : ""}` +
+    (s.idleReconnects ? ` · 无数据重连 ${s.idleReconnects} 次` : "");
+}
+
+// ---------- 视图 ----------
+let W = 0, H = 0, dpr = 1;
+function resize() {
+  const top = $("bar").getBoundingClientRect().height;
+  $("wrap").style.top = top + "px";
+  dpr = window.devicePixelRatio || 1;
+  const r = cv.getBoundingClientRect();
+  W = r.width; H = r.height;
+  cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
+  draw();
+}
+window.addEventListener("resize", resize);
+new ResizeObserver(resize).observe($("bar"));  // 工具栏换行时调整画布位置
+const plotW = () => W - AXIS_W, plotH = () => H - SUM_H;
+const rowOf = (ticks) => ticks / sub.bucket;
+function xLeft(i) { return plotW() - (bars.length - i + view.ro) * view.colW; }
+function yCenter(r) { return plotH() / 2 - (r - view.center) * view.rowH; }
+
+function resetView() {
+  view.follow = true; $("follow").checked = true;
+  view.ro = 0.3;
+  if (bars.length) view.center = rowOf(Math.floor(bars[bars.length - 1].c / sub.bucket) * sub.bucket);
+}
+function followLatest(force) {
+  view.ro = 0.3;
+  if (!bars.length) return;
+  const r = rowOf(Math.floor(bars[bars.length - 1].c / sub.bucket) * sub.bucket);
+  const y = yCenter(r), h = plotH();
+  if (force || y < h * 0.2 || y > h * 0.8) view.center = r;
+}
+function setFollow(v) { view.follow = v; $("follow").checked = v; }
+
+// ---------- 绘制 ----------
+function draw() { if (!needDraw) { needDraw = true; requestAnimationFrame(render); } }
+function cellColor(d, maxAbs) {
+  if (d === 0) return "rgba(125,133,144,0.10)";
+  const a = 0.10 + 0.72 * Math.sqrt(Math.min(1, Math.abs(d) / maxAbs));
+  return d > 0 ? `rgba(34,197,94,${a.toFixed(3)})` : `rgba(239,68,68,${a.toFixed(3)})`;
+}
+function imbal(b, c) {
+  // c = [bucket, 买, 卖, 买笔数, 卖笔数]；对角比较：本档买 vs 下一档卖，本档卖 vs 上一档买。
+  // 返回 [买方比值, 卖方比值]，0 表示不构成失衡，Infinity 表示对角档为 0（未勾选「忽略零值」时）
+  const lower = b.map.get(c[0] - sub.bucket), upper = b.map.get(c[0] + sub.bucket);
+  const dSell = lower ? lower[2] : 0, dBuy = upper ? upper[1] : 0;
+  const one = (q, d) => {
+    if (q <= 0 || q < opt.minUnits) return 0;
+    if (d <= 0) return opt.ignoreZeros ? 0 : Infinity;
+    const r = q / d;
+    return r >= opt.ratio ? r : 0;
+  };
+  return [one(c[1], dSell), one(c[2], dBuy)];
+}
+function imbAlpha(r) { return r === Infinity ? 1 : 0.35 + 0.65 * Math.min(1, (r / opt.ratio - 1) / 2); }
+
+function render() {
+  needDraw = false;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = "#0f1216"; ctx.fillRect(0, 0, W, H);
+  if (!sub || !spec) return;
+  const pw = plotW(), ph = plotH(), cw = view.colW, rh = view.rowH, bk = sub.bucket;
+  if (!bars.length) {
+    ctx.fillStyle = "#7d8590"; ctx.font = "14px sans-serif"; ctx.textAlign = "center";
+    ctx.fillText("等待数据…", pw / 2, ph / 2); return;
+  }
+  const n = bars.length;
+  const i0 = Math.max(0, Math.floor(n + view.ro - pw / cw) - 1), i1 = n - 1;
+  const rTop = Math.ceil(view.center + ph / 2 / rh) + 1, rBot = Math.floor(view.center - ph / 2 / rh) - 1;
+  const bTop = rTop * bk, bBot = rBot * bk;
+
+  // 颜色强度：按可见格子的 |delta| 最大值归一
+  let maxAbs = 1;
+  for (let i = i0; i <= i1; i++) {
+    if (xLeft(i) + cw < 0) continue;
+    for (const c of bars[i].cells) {
+      if (c[0] > bTop || c[0] < bBot) continue;
+      const d = Math.abs(c[1] - c[2]); if (d > maxAbs) maxAbs = d;
+    }
+  }
+
+  const fs = Math.min(12, Math.floor(rh - 3));
+  const showText = fs >= 8;
+  const charW = fs * 0.6;
+  ctx.save();
+  ctx.beginPath(); ctx.rect(0, 0, pw, ph); ctx.clip();
+
+  // 横向网格
+  ctx.fillStyle = "rgba(255,255,255,0.025)";
+  for (let r = rBot; r <= rTop; r++) if (((r % 2) + 2) % 2 === 0) ctx.fillRect(0, yCenter(r) - rh / 2, pw, rh);
+
+  // 最新价线（画在格子下面）
+  const last = bars[n - 1];
+  const yLast = yCenter(rowOf(Math.floor(last.c / bk) * bk));
+  ctx.strokeStyle = "rgba(96,165,250,0.45)"; ctx.setLineDash([4, 4]); ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(0, yLast); ctx.lineTo(pw, yLast); ctx.stroke(); ctx.setLineDash([]);
+
+  ctx.textBaseline = "middle";
+  for (let i = i0; i <= i1; i++) {
+    const b = bars[i], x0 = xLeft(i);
+    if (x0 > pw || x0 + cw < 0) continue;
+    const live = i === n - 1;
+    const cx0 = x0 + COL_PAD, cwi = cw - COL_PAD - 1;
+    if (live) { ctx.fillStyle = "rgba(96,165,250,0.06)"; ctx.fillRect(x0, 0, cw, ph); }
+    // 开盘到收盘细条 + 高低影线（列左侧）
+    const up = b.c >= b.o, ocCol = up ? "#22c55e" : "#ef4444";
+    const yH = yCenter(rowOf(Math.floor(b.h / bk) * bk)) - rh / 2, yL = yCenter(rowOf(Math.floor(b.l / bk) * bk)) + rh / 2;
+    const yo = yCenter(rowOf(Math.floor(b.o / bk) * bk)), yc = yCenter(rowOf(Math.floor(b.c / bk) * bk));
+    ctx.fillStyle = ocCol; ctx.globalAlpha = 0.45; ctx.fillRect(x0 + 2, yH, 1, yL - yH); ctx.globalAlpha = 1;
+    ctx.fillRect(x0 + 1, Math.min(yo, yc) - rh / 2 + 1, 3, Math.abs(yo - yc) + rh - 2);
+
+    const textOK = showText && cwi >= 20;
+    if (textOK) ctx.font = `${fs}px ui-monospace, Menlo, monospace`;
+    for (const c of b.cells) {
+      if (c[0] > bTop || c[0] < bBot) continue;
+      const yc2 = yCenter(rowOf(c[0])), y = yc2 - rh / 2;
+      ctx.fillStyle = cellColor(c[1] - c[2], maxAbs);
+      ctx.fillRect(cx0, y + 0.5, cwi, rh - 1);
+      const [bi, si] = imbal(b, c);
+      // 失衡边条：比值越大越不透明（到 3 倍阈值时最深）
+      if (bi) { ctx.globalAlpha = imbAlpha(bi); ctx.fillStyle = "#22c55e"; ctx.fillRect(cx0 + cwi - 3, y + 0.5, 3, rh - 1); }
+      if (si) { ctx.globalAlpha = imbAlpha(si); ctx.fillStyle = "#ef4444"; ctx.fillRect(cx0, y + 0.5, 3, rh - 1); }
+      ctx.globalAlpha = 1;
+      if (textOK) {
+        const ss = abbrU(c[2]), bs = abbrU(c[1]);
+        if ((ss.length + bs.length + 3) * charW <= cwi - 4) {
+          const mid = cx0 + cwi / 2;
+          ctx.textAlign = "right"; ctx.fillStyle = si ? "#ff8a8a" : "#d8dee4";
+          if (si) ctx.font = `bold ${fs}px ui-monospace, Menlo, monospace`;
+          ctx.fillText(ss, mid - charW * 0.9, yc2);
+          if (si) ctx.font = `${fs}px ui-monospace, Menlo, monospace`;
+          ctx.textAlign = "center"; ctx.fillStyle = "#6e7681"; ctx.fillText("×", mid, yc2);
+          ctx.textAlign = "left"; ctx.fillStyle = bi ? "#6ef29a" : "#d8dee4";
+          if (bi) ctx.font = `bold ${fs}px ui-monospace, Menlo, monospace`;
+          ctx.fillText(bs, mid + charW * 0.9, yc2);
+          if (bi) ctx.font = `${fs}px ui-monospace, Menlo, monospace`;
+        }
+      }
+    }
+    // POC
+    if (b.poc <= bTop && b.poc >= bBot) {
+      const y = yCenter(rowOf(b.poc)) - rh / 2;
+      ctx.strokeStyle = "#facc15"; ctx.lineWidth = 1.5;
+      ctx.strokeRect(cx0 + 0.75, y + 1.25, cwi - 1.5, rh - 2.5);
+    }
+  }
+  // 悬停十字
+  if (mouse && mouse.hit) {
+    ctx.strokeStyle = "rgba(255,255,255,0.35)"; ctx.lineWidth = 1;
+    ctx.strokeRect(xLeft(mouse.hit.i) + COL_PAD - 0.5, yCenter(mouse.hit.r) - rh / 2, cw - COL_PAD, rh);
+  }
+  ctx.restore();
+
+  // 价格轴
+  ctx.fillStyle = "#171b21"; ctx.fillRect(pw, 0, AXIS_W, H);
+  ctx.strokeStyle = "#262c35"; ctx.beginPath(); ctx.moveTo(pw + 0.5, 0); ctx.lineTo(pw + 0.5, H); ctx.stroke();
+  ctx.font = "11px ui-monospace, Menlo, monospace"; ctx.textAlign = "left"; ctx.textBaseline = "middle";
+  const step = Math.max(1, Math.ceil(14 / rh));
+  for (let r = rBot; r <= rTop; r++) {
+    if (((r % step) + step) % step) continue;
+    const y = yCenter(r); if (y < 6 || y > ph - 6) continue;
+    ctx.fillStyle = "#7d8590"; ctx.fillText(bucketLabel(r * bk), pw + 6, y);
+  }
+  if (yLast > 0 && yLast < ph) {
+    ctx.fillStyle = "#2563eb"; ctx.fillRect(pw + 1, yLast - 8, AXIS_W - 1, 16);
+    ctx.fillStyle = "#fff"; ctx.fillText(priceOfTicks(last.c), pw + 6, yLast);
+  }
+
+  // 底部汇总：时间 / 成交量 / delta / CVD
+  const y0 = ph;
+  ctx.fillStyle = "#171b21"; ctx.fillRect(0, y0, pw, SUM_H);
+  ctx.strokeStyle = "#262c35"; ctx.beginPath(); ctx.moveTo(0, y0 + 0.5); ctx.lineTo(pw, y0 + 0.5); ctx.stroke();
+  ctx.font = "10.5px ui-monospace, Menlo, monospace"; ctx.textAlign = "center";
+  const sec = sub.interval === "30s";
+  const timeEvery = Math.max(1, Math.ceil((sec ? 60 : 44) / cw));
+  const txt = cw >= 34;
+  ctx.save(); ctx.beginPath(); ctx.rect(0, y0, pw, SUM_H); ctx.clip();  // 不画进价格轴区域
+  for (let i = i0; i <= i1; i++) {
+    const b = bars[i], x0 = xLeft(i), xm = x0 + COL_PAD / 2 + cw / 2;
+    if (x0 > pw || x0 + cw < 0) continue;
+    if (i % timeEvery === 0) { ctx.fillStyle = "#7d8590"; ctx.fillText(hm(b.t, sec), xm, y0 + 3 + SUM_ROW * 0.5); }
+    if (txt) {
+      ctx.fillStyle = "#c9d1d9"; ctx.fillText(abbrU(b.v), xm, y0 + 3 + SUM_ROW * 1.5);
+      ctx.fillStyle = b.delta >= 0 ? "#22c55e" : "#ef4444"; ctx.fillText(signed(b.delta), xm, y0 + 3 + SUM_ROW * 2.5);
+      ctx.fillStyle = b.cvd >= 0 ? "#4ade80" : "#f87171"; ctx.fillText(signed(b.cvd), xm, y0 + 3 + SUM_ROW * 3.5);
+    } else {
+      ctx.fillStyle = b.delta >= 0 ? "rgba(34,197,94,.7)" : "rgba(239,68,68,.7)";
+      ctx.fillRect(x0 + COL_PAD, y0 + 3 + SUM_ROW * 2 + 3, cw - COL_PAD - 1, SUM_ROW - 6);
+    }
+  }
+  ctx.restore();
+  ctx.fillStyle = "#7d8590"; ctx.textAlign = "left";
+  ["时间", "成交量", "Delta", "CVD"].forEach((s, k) => ctx.fillText(s, pw + 6, y0 + 3 + SUM_ROW * (k + 0.5)));
+  if (!view.follow) { ctx.fillStyle = "#facc15"; ctx.textAlign = "right"; ctx.fillText("跟随已关闭（双击恢复）", pw - 8, 10); }
+  if (histPending) { ctx.fillStyle = "#7d8590"; ctx.textAlign = "left"; ctx.fillText("加载更早数据…", 8, 10); }
+  maybeLoadHistory();
+}
+
+// ---------- 交互 ----------
+function hitTest(x, y) {
+  if (!bars.length || x >= plotW() || y >= plotH()) return null;
+  const i = Math.floor(bars.length + view.ro - (plotW() - x) / view.colW);
+  if (i < 0 || i >= bars.length) return null;
+  const r = Math.round(view.center + (plotH() / 2 - y) / view.rowH);
+  return { i, r };
+}
+let drag = null;
+cv.addEventListener("mousedown", (e) => { drag = { x: e.clientX, y: e.clientY, ro: view.ro, c: view.center, moved: false }; });
+window.addEventListener("mouseup", () => { drag = null; cv.classList.remove("drag"); });
+window.addEventListener("mousemove", (e) => {
+  const r = cv.getBoundingClientRect();
+  if (drag) {
+    const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+    if (!drag.moved && Math.abs(dx) + Math.abs(dy) > 3) { drag.moved = true; setFollow(false); cv.classList.add("drag"); }
+    if (drag.moved) {
+      // ro = 最新一根右侧空出的列数；越负越往历史方向。允许拖到最早一根接近右边、或最新一根接近左边
+      view.ro = Math.max(-(bars.length - 2), Math.min(plotW() / view.colW - 2, drag.ro - dx / view.colW));
+      view.center = drag.c + dy / view.rowH;
+      tip.hidden = true; draw(); return;
+    }
+  }
+  const x = e.clientX - r.left, y = e.clientY - r.top;
+  if (x < 0 || y < 0 || x > r.width || y > r.height) { if (mouse) { mouse = null; tip.hidden = true; draw(); } return; }
+  mouse = { x, y, cx: e.clientX, cy: e.clientY, hit: hitTest(x, y) };
+  showTip(); draw();
+});
+cv.addEventListener("mouseleave", () => { mouse = null; tip.hidden = true; draw(); });
+cv.addEventListener("dblclick", () => { setFollow(true); followLatest(true); draw(); });
+cv.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  const r = cv.getBoundingClientRect(), x = e.clientX - r.left, y = e.clientY - r.top;
+  const f = Math.exp(-e.deltaY * 0.0015);
+  const doX = !e.altKey, doY = !e.shiftKey;
+  if (doX) {
+    const nw = Math.min(260, Math.max(4, view.colW * f));
+    if (!view.follow) {
+      const fromRight = (plotW() - Math.min(x, plotW())) / view.colW + 0;  // 鼠标处的列保持不动
+      view.ro = view.ro + fromRight - fromRight * view.colW / nw;
+    }
+    view.colW = nw;
+  }
+  if (doY) {
+    const nh = Math.min(48, Math.max(3, view.rowH * f));
+    const ry = view.center + (plotH() / 2 - Math.min(y, plotH())) / view.rowH;
+    view.rowH = nh;
+    view.center = ry - (plotH() / 2 - Math.min(y, plotH())) / nh;
+  }
+  if (view.follow) followLatest();
+  if (mouse) mouse.hit = hitTest(mouse.x, mouse.y);
+  showTip(); draw();
+}, { passive: false });
+
+function showTip() {
+  if (!mouse || !mouse.hit || drag?.moved) { tip.hidden = true; return; }
+  const { i, r } = mouse.hit, b = bars[i], bk = sub.bucket, p = r * bk;
+  const c = b.map.get(p) || [p, 0, 0, 0, 0];
+  const [bi, si] = imbal(b, c);
+  const lower = b.map.get(p - bk), upper = b.map.get(p + bk);
+  const ivms = IV_MS[sub.interval];
+  const ratio = (a, d) => d > 0 ? (a / d).toFixed(2) + "×" : (a > 0 ? "∞" : "-");
+  tip.innerHTML =
+    `<b>${ymdhms(b.t)} → ${hm(b.t + ivms, true)}</b>${i === bars.length - 1 ? ' <span class="buy">（未收盘）</span>' : ""}<br>` +
+    `<span class="k">价位</span>${priceOfTicks(p)} ~ ${priceOfTicks(p + bk)}${p === b.poc ? ' <span style="color:var(--poc)">POC</span>' : ""}<br>` +
+    `<span class="k">主动卖</span><span class="sell">${fullQ(c[2])}</span>（${c[4]} 笔）${si ? ' <b class="sell">卖方失衡</b>' : ""}<br>` +
+    `<span class="k">主动买</span><span class="buy">${fullQ(c[1])}</span>（${c[3]} 笔）${bi ? ' <b class="buy">买方失衡</b>' : ""}<br>` +
+    `<span class="k">Delta</span><span class="${c[1] >= c[2] ? "buy" : "sell"}">${fullQ(c[1] - c[2])}</span><br>` +
+    `<span class="k">合计</span>${fullQ(c[1] + c[2])}<br>` +
+    `<span class="k">对角比</span>买/下档卖 ${ratio(c[1], lower ? lower[2] : 0)} · 卖/上档买 ${ratio(c[2], upper ? upper[1] : 0)}` +
+    `<hr><span class="k">开高低收</span>${priceOfTicks(b.o)} / ${priceOfTicks(b.h)} / ${priceOfTicks(b.l)} / ${priceOfTicks(b.c)}<br>` +
+    `<span class="k">成交量</span>${fullQ(b.v)}（${b.n.toLocaleString()} 笔）<br>` +
+    `<span class="k">主动买/卖</span><span class="buy">${fullQ(b.buy)}</span> / <span class="sell">${fullQ(b.sell)}</span><br>` +
+    `<span class="k">Delta</span>${fullQ(b.delta)}（最大 ${fullQ(b.dmax)} / 最小 ${fullQ(b.dmin)}）<br>` +
+    `<span class="k">CVD</span>${fullQ(b.cvd)}<br>` +
+    `<span class="k">POC</span>${priceOfTicks(b.poc)}`;
+  tip.hidden = false;
+  const tw = tip.offsetWidth, th = tip.offsetHeight;
+  let lx = mouse.cx + 16, ly = mouse.cy + 16;
+  if (lx + tw > window.innerWidth - 8) lx = mouse.cx - tw - 16;
+  if (ly + th > window.innerHeight - 8) ly = Math.max(8, mouse.cy - th - 16);
+  tip.style.left = lx + "px"; tip.style.top = ly + "px";
+}
+
+resize();
+connect();
+</script>
+</body>
+</html>
